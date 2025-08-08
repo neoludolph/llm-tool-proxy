@@ -7,7 +7,7 @@ const { SafeToolExecutor } = require('./dist/tools');
 async function testTools() {
   console.log('🧪 Testing Tool Executor...\n');
   
-  const executor = new SafeToolExecutor('c:\\develop\\tool-proxy\\workspace');
+  const executor = new SafeToolExecutor('c:\\develop\\llm-tool-proxy\\workspace');
   
   // Test 1: List files
   console.log('1. Testing list_files...');

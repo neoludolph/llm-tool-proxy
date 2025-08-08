@@ -2,7 +2,7 @@
  * Main server implementation with OpenAI-compatible streaming proxy
  */
 
-import express from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { createParser } from 'eventsource-parser';
 import * as dotenv from 'dotenv';
 import { 
@@ -24,14 +24,14 @@ import { SYSTEM_PROMPT } from './prompts';
 dotenv.config();
 
 const app = express();
-const PORT = parseInt(process.env.PORT || '11434');
+const PORT = parseInt(process.env.PORT || '3001');
 
 // Middleware
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 
 // CORS headers for browser compatibility
-app.use((req, res, next) => {
+app.use((req: Request, res: Response, next: NextFunction) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
@@ -45,48 +45,58 @@ app.use((req, res, next) => {
 });
 
 // Health check endpoint
-app.get('/healthz', (req, res) => {
+app.get('/healthz', (_req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
 // Main chat completions endpoint
-app.post('/v1/chat/completions', async (req, res): Promise<void> => {
+app.post('/v1/chat/completions', async (req: Request, res: Response): Promise<void> => {
   try {
-    const { messages, model, stream = true, ...otherParams } = req.body;
+  const { messages, model, stream = true, tools, tool_choice, ...otherParams } = req.body;
 
     if (!messages || !Array.isArray(messages)) {
       res.status(400).json({ error: 'Invalid messages format' });
       return;
     }
 
-    // Inject system prompt to enforce tool call format
-    const modifiedMessages = [
-      { role: 'system', content: SYSTEM_PROMPT },
-      ...messages.filter((msg: any) => msg.role !== 'system')
-    ];
+    // Determine mode: Agent (native tools) vs Local tools via JSON-fences
+    const isAgentMode = Array.isArray(tools) || typeof tool_choice !== 'undefined';
+
+    // Inject system prompt only in local-tools mode
+    const modifiedMessages = isAgentMode
+      ? messages
+      : [
+          { role: 'system', content: SYSTEM_PROMPT },
+          ...messages.filter((msg: any) => msg.role !== 'system')
+        ];
 
     // Prepare upstream request
-    const upstreamRequest = {
+    const upstreamRequest: any = {
       messages: modifiedMessages,
       model: model || process.env.DEFAULT_MODEL || 'llama3.1:8b',
       stream: true,
       ...otherParams
     };
 
-    // Remove any tools from the request since we handle them locally
-    delete upstreamRequest.tools;
-    delete upstreamRequest.tool_choice;
+    // Preserve tools for Agent mode; strip for local-tools mode
+    if (isAgentMode) {
+      if (Array.isArray(tools)) upstreamRequest.tools = tools;
+      if (typeof tool_choice !== 'undefined') upstreamRequest.tool_choice = tool_choice;
+    }
 
-    // Set up SSE headers
+    // Set up SSE headers (must be event-stream for OpenAI-compatible clients)
     res.writeHead(200, {
-      'Content-Type': 'text/plain; charset=utf-8',
-      'Cache-Control': 'no-cache',
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
       'Connection': 'keep-alive',
       'Access-Control-Allow-Origin': '*',
+      'X-Accel-Buffering': 'no'
     });
 
-    // Send initial chunk
-    res.write(createSSEChunk(createInitialChunk()));
+    // Send initial chunk in local-tools mode only (Agent mode will receive role chunk from upstream)
+    if (!isAgentMode) {
+      res.write(createSSEChunk(createInitialChunk()));
+    }
 
     // Make request to upstream
     const upstreamUrl = process.env.UPSTREAM_URL;
@@ -111,18 +121,44 @@ app.post('/v1/chat/completions', async (req, res): Promise<void> => {
       throw new Error('No response body from upstream');
     }
 
+    // In Agent mode, pass through upstream SSE stream unmodified
+    if (isAgentMode) {
+      const reader = upstreamResponse.body.getReader();
+      const decoder = new TextDecoder();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          res.write(chunk);
+        }
+      } catch (error) {
+        console.error('Agent-mode passthrough error:', error);
+      } finally {
+        res.end();
+      }
+      return;
+    }
+
     // Buffer for accumulating content
     let contentBuffer = '';
-    let processedJsonBlocks = new Set<string>();
+    const processedJsonBlocks = new Set<string>();
+    let pendingToolTasks = 0;
+    let upstreamDone = false;
+    const maybeFinish = () => {
+      if (upstreamDone && pendingToolTasks === 0) {
+        res.write(createSSEChunk(createFinalChunk()));
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+    };
 
     // Create parser for SSE stream
     const parser = createParser((event) => {
       if (event.type === 'event') {
         if (event.data === '[DONE]') {
-          // Send final chunk and close
-          res.write(createSSEChunk(createFinalChunk()));
-          res.write('data: [DONE]\n\n');
-          res.end();
+          upstreamDone = true;
+          maybeFinish();
           return;
         }
 
@@ -159,15 +195,22 @@ app.post('/v1/chat/completions', async (req, res): Promise<void> => {
                 res.write(createSSEChunk(toolCallChunk));
 
                 // Execute tool asynchronously
-                executeTool(toolCall).then(result => {
-                  // Send tool result as content
-                  const resultChunk = createContentChunk(`\n\n${result}`);
-                  res.write(createSSEChunk(resultChunk));
-                }).catch(error => {
-                  // Send error as content
-                  const errorChunk = createContentChunk(`\n\nTOOL_ERROR: ${error.message}`);
-                  res.write(createSSEChunk(errorChunk));
-                });
+                pendingToolTasks++;
+                executeTool(toolCall)
+                  .then(result => {
+                    // Send tool result as content
+                    const resultChunk = createContentChunk(`\n\n${result}`);
+                    res.write(createSSEChunk(resultChunk));
+                  })
+                  .catch(error => {
+                    // Send error as content
+                    const errorChunk = createContentChunk(`\n\nTOOL_ERROR: ${error.message}`);
+                    res.write(createSSEChunk(errorChunk));
+                  })
+                  .finally(() => {
+                    pendingToolTasks = Math.max(0, pendingToolTasks - 1);
+                    maybeFinish();
+                  });
 
                 // Remove the processed JSON block from content buffer
                 const jsonFence = `\`\`\`json\n${jsonBlock}\n\`\`\``;
@@ -180,17 +223,17 @@ app.post('/v1/chat/completions', async (req, res): Promise<void> => {
               // Only send content that doesn't contain JSON blocks
               const cleanContent = delta.content.replace(/```json[\s\S]*?```/g, '');
               if (cleanContent.trim()) {
-                res.write(createSSEChunk(data));
+                const contentChunk = createContentChunk(cleanContent);
+                res.write(createSSEChunk(contentChunk));
               }
             }
           } else {
-            // Forward other types of deltas (role, etc.)
-            res.write(createSSEChunk(data));
+            // Ignore other upstream deltas to keep response schema consistent
           }
         } catch (error) {
           console.error('Error parsing SSE data:', error);
-          // Forward the original data if parsing fails
-          res.write(createSSEChunk({ error: 'Parse error' }));
+          // Emit a content delta with a parse error message to keep schema stable
+          res.write(createSSEChunk(createContentChunk('\n\n[Proxy Parse Error] Unable to parse upstream chunk.')));
         }
       }
     });
@@ -208,13 +251,13 @@ app.post('/v1/chat/completions', async (req, res): Promise<void> => {
         parser.feed(chunk);
       }
     } catch (error) {
-      console.error('Error reading stream:', error);
-      res.write(createSSEChunk({ error: 'Stream error' }));
+  console.error('Error reading stream:', error);
+  res.write(createSSEChunk(createContentChunk('\n\n[Proxy Stream Error] Upstream stream interrupted.')));
       res.end();
     }
 
   } catch (error) {
-    console.error('Error in chat completions:', error);
+  console.error('Error in chat completions:', error);
     
     if (!res.headersSent) {
       res.status(500).json({ 
@@ -222,14 +265,14 @@ app.post('/v1/chat/completions', async (req, res): Promise<void> => {
         message: error instanceof Error ? error.message : 'Unknown error'
       });
     } else {
-      res.write(createSSEChunk({ error: 'Internal server error' }));
+      res.write(createSSEChunk(createContentChunk('\n\n[Proxy Error] Internal server error.')));
       res.end();
     }
   }
 });
 
 // Catch-all for unsupported endpoints
-app.use('*', (req, res) => {
+app.use('*', (_req: Request, res: Response) => {
   res.status(404).json({ 
     error: 'Not found',
     message: 'This proxy only supports /v1/chat/completions and /healthz'

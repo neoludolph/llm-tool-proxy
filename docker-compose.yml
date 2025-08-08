@@ -4,7 +4,7 @@ services:
   llm-tool-proxy:
     build: .
     ports:
-      - "11434:11434"
+      - "3001:3001"
     volumes:
       - ./workspace:/app/workspace
     env_file:

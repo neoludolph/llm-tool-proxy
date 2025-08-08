@@ -44,7 +44,7 @@ const tools_1 = require("./tools");
 const prompts_1 = require("./prompts");
 dotenv.config();
 const app = (0, express_1.default)();
-const PORT = parseInt(process.env.PORT || '11434');
+const PORT = parseInt(process.env.PORT || '3001');
 app.use(express_1.default.json({ limit: '10mb' }));
 app.use(express_1.default.urlencoded({ extended: true }));
 app.use((req, res, next) => {
@@ -57,35 +57,45 @@ app.use((req, res, next) => {
     }
     next();
 });
-app.get('/healthz', (req, res) => {
+app.get('/healthz', (_req, res) => {
     res.json({ ok: true });
 });
 app.post('/v1/chat/completions', async (req, res) => {
     try {
-        const { messages, model, stream = true, ...otherParams } = req.body;
+        const { messages, model, stream = true, tools, tool_choice, ...otherParams } = req.body;
         if (!messages || !Array.isArray(messages)) {
             res.status(400).json({ error: 'Invalid messages format' });
             return;
         }
-        const modifiedMessages = [
-            { role: 'system', content: prompts_1.SYSTEM_PROMPT },
-            ...messages.filter((msg) => msg.role !== 'system')
-        ];
+        const isAgentMode = Array.isArray(tools) || typeof tool_choice !== 'undefined';
+        const modifiedMessages = isAgentMode
+            ? messages
+            : [
+                { role: 'system', content: prompts_1.SYSTEM_PROMPT },
+                ...messages.filter((msg) => msg.role !== 'system')
+            ];
         const upstreamRequest = {
             messages: modifiedMessages,
             model: model || process.env.DEFAULT_MODEL || 'llama3.1:8b',
             stream: true,
             ...otherParams
         };
-        delete upstreamRequest.tools;
-        delete upstreamRequest.tool_choice;
+        if (isAgentMode) {
+            if (Array.isArray(tools))
+                upstreamRequest.tools = tools;
+            if (typeof tool_choice !== 'undefined')
+                upstreamRequest.tool_choice = tool_choice;
+        }
         res.writeHead(200, {
-            'Content-Type': 'text/plain; charset=utf-8',
-            'Cache-Control': 'no-cache',
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache, no-transform',
             'Connection': 'keep-alive',
             'Access-Control-Allow-Origin': '*',
+            'X-Accel-Buffering': 'no'
         });
-        res.write((0, util_1.createSSEChunk)((0, util_1.createInitialChunk)()));
+        if (!isAgentMode) {
+            res.write((0, util_1.createSSEChunk)((0, util_1.createInitialChunk)()));
+        }
         const upstreamUrl = process.env.UPSTREAM_URL;
         if (!upstreamUrl) {
             throw new Error('UPSTREAM_URL not configured');
@@ -104,14 +114,42 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (!upstreamResponse.body) {
             throw new Error('No response body from upstream');
         }
+        if (isAgentMode) {
+            const reader = upstreamResponse.body.getReader();
+            const decoder = new TextDecoder();
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done)
+                        break;
+                    const chunk = decoder.decode(value, { stream: true });
+                    res.write(chunk);
+                }
+            }
+            catch (error) {
+                console.error('Agent-mode passthrough error:', error);
+            }
+            finally {
+                res.end();
+            }
+            return;
+        }
         let contentBuffer = '';
-        let processedJsonBlocks = new Set();
+        const processedJsonBlocks = new Set();
+        let pendingToolTasks = 0;
+        let upstreamDone = false;
+        const maybeFinish = () => {
+            if (upstreamDone && pendingToolTasks === 0) {
+                res.write((0, util_1.createSSEChunk)((0, util_1.createFinalChunk)()));
+                res.write('data: [DONE]\n\n');
+                res.end();
+            }
+        };
         const parser = (0, eventsource_parser_1.createParser)((event) => {
             if (event.type === 'event') {
                 if (event.data === '[DONE]') {
-                    res.write((0, util_1.createSSEChunk)((0, util_1.createFinalChunk)()));
-                    res.write('data: [DONE]\n\n');
-                    res.end();
+                    upstreamDone = true;
+                    maybeFinish();
                     return;
                 }
                 try {
@@ -131,12 +169,19 @@ app.post('/v1/chat/completions', async (req, res) => {
                                 const toolCallId = (0, util_1.generateToolCallId)();
                                 const toolCallChunk = (0, util_1.createToolCallChunk)(toolCallId, toolCall.tool, JSON.stringify(toolCall.args));
                                 res.write((0, util_1.createSSEChunk)(toolCallChunk));
-                                (0, tools_1.executeTool)(toolCall).then(result => {
+                                pendingToolTasks++;
+                                (0, tools_1.executeTool)(toolCall)
+                                    .then(result => {
                                     const resultChunk = (0, util_1.createContentChunk)(`\n\n${result}`);
                                     res.write((0, util_1.createSSEChunk)(resultChunk));
-                                }).catch(error => {
+                                })
+                                    .catch(error => {
                                     const errorChunk = (0, util_1.createContentChunk)(`\n\nTOOL_ERROR: ${error.message}`);
                                     res.write((0, util_1.createSSEChunk)(errorChunk));
+                                })
+                                    .finally(() => {
+                                    pendingToolTasks = Math.max(0, pendingToolTasks - 1);
+                                    maybeFinish();
                                 });
                                 const jsonFence = `\`\`\`json\n${jsonBlock}\n\`\`\``;
                                 contentBuffer = contentBuffer.replace(jsonFence, '');
@@ -145,17 +190,17 @@ app.post('/v1/chat/completions', async (req, res) => {
                         if (delta.content && !(0, util_1.extractJsonBlocks)(delta.content).length) {
                             const cleanContent = delta.content.replace(/```json[\s\S]*?```/g, '');
                             if (cleanContent.trim()) {
-                                res.write((0, util_1.createSSEChunk)(data));
+                                const contentChunk = (0, util_1.createContentChunk)(cleanContent);
+                                res.write((0, util_1.createSSEChunk)(contentChunk));
                             }
                         }
                     }
                     else {
-                        res.write((0, util_1.createSSEChunk)(data));
                     }
                 }
                 catch (error) {
                     console.error('Error parsing SSE data:', error);
-                    res.write((0, util_1.createSSEChunk)({ error: 'Parse error' }));
+                    res.write((0, util_1.createSSEChunk)((0, util_1.createContentChunk)('\n\n[Proxy Parse Error] Unable to parse upstream chunk.')));
                 }
             }
         });
@@ -172,7 +217,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
         catch (error) {
             console.error('Error reading stream:', error);
-            res.write((0, util_1.createSSEChunk)({ error: 'Stream error' }));
+            res.write((0, util_1.createSSEChunk)((0, util_1.createContentChunk)('\n\n[Proxy Stream Error] Upstream stream interrupted.')));
             res.end();
         }
     }
@@ -185,12 +230,12 @@ app.post('/v1/chat/completions', async (req, res) => {
             });
         }
         else {
-            res.write((0, util_1.createSSEChunk)({ error: 'Internal server error' }));
+            res.write((0, util_1.createSSEChunk)((0, util_1.createContentChunk)('\n\n[Proxy Error] Internal server error.')));
             res.end();
         }
     }
 });
-app.use('*', (req, res) => {
+app.use('*', (_req, res) => {
     res.status(404).json({
         error: 'Not found',
         message: 'This proxy only supports /v1/chat/completions and /healthz'

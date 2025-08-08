@@ -98,7 +98,7 @@ function createInitialChunk(index = 0) {
         model: 'proxy-model',
         choices: [{
                 index,
-                delta: {},
+                delta: { role: 'assistant' },
                 finish_reason: null
             }]
     };
