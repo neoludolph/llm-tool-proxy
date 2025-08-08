@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  llm-tool-proxy:
+    build: .
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./workspace:/app/workspace
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+    user: "1000:1000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
+    networks:
+      - tool-proxy-network
+
+networks:
+  tool-proxy-network:
+    driver: bridge
